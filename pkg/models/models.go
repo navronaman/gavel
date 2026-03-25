@@ -27,6 +27,13 @@ type AnalysisResult struct {
 	Summary    string
 }
 
+// ProcessedArticle pairs an Article with its AI analysis result. It is the
+// unit of work flowing from the Batcher to the DBWriter.
+type ProcessedArticle struct {
+	Article Article
+	Result  AnalysisResult
+}
+
 // PolicyEvent is the final enriched record written to PostgreSQL.
 type PolicyEvent struct {
 	RawArticleID string

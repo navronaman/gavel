@@ -9,9 +9,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"gavel/internal/fetcher"
+	"gavel/internal/processor"
 	"gavel/internal/queue"
 	"gavel/pkg/models"
 )
@@ -20,9 +22,9 @@ const (
 	numWorkers    = 25
 	resultsBuf    = 2000
 	processedBuf  = 2000
+	batchedBuf    = 500
 	pollInterval  = 5 * time.Minute
 	reconnectWait = 5 * time.Second
-	logInterval   = 10 * time.Second
 	streamKey     = "articles:raw"
 	groupName     = "gavel-processors"
 	consumerBatch = int64(50)
@@ -32,81 +34,114 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	redisClient := newRedisClient()
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		log.Fatalf("[engine] redis ping: %v", err)
-	}
+	// ── Infrastructure clients ─────────────────────────────────────────────────
+	redisClient := mustRedis(ctx)
+	pgPool := mustPostgres(ctx)
+	defer pgPool.Close()
 
-	// Phase 1: ingestion → results channel
-	results := make(chan models.Article, resultsBuf)
+	aiClient, err := processor.NewAIClient(getenv("AI_SERVICE_GRPC", "localhost:50051"))
+	if err != nil {
+		log.Fatalf("[engine] ai client: %v", err)
+	}
+	defer aiClient.Close()
+
+	// ── Channels ───────────────────────────────────────────────────────────────
+	results := make(chan models.Article, resultsBuf)   // ingestion → Redis producer
+	processed := make(chan models.Article, processedBuf) // Redis consumer → batcher
+	batched := make(chan models.ProcessedArticle, batchedBuf) // batcher → db writer
+
+	// ── Component wiring ───────────────────────────────────────────────────────
 	pool := fetcher.NewWorkerPool(numWorkers, results)
 	stream := fetcher.NewStreamReader(pool.ArticlePool, results)
 
-	// Phase 2: results → Redis Stream → processed channel
-	producer := queue.NewProducer(redisClient, streamKey)
+	prod := queue.NewProducer(redisClient, streamKey)
 
 	hostname, _ := os.Hostname()
-	consumer := queue.NewConsumer(redisClient, streamKey, groupName, hostname, consumerBatch)
-	processed := make(chan models.Article, processedBuf)
+	cons := queue.NewConsumer(redisClient, streamKey, groupName, hostname, consumerBatch)
+
+	batcher := processor.NewBatcher(processed, aiClient)
+	writer := processor.NewDBWriter(pgPool)
 
 	var wg sync.WaitGroup
 
-	// Source URL feeder
+	// Phase 1 — ingestion
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		feedJobs(ctx, pool.Jobs)
-	}()
+	go func() { defer wg.Done(); feedJobs(ctx, pool.Jobs) }()
 
-	// RSS worker pool
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		pool.Start(ctx)
-	}()
+	go func() { defer wg.Done(); pool.Start(ctx) }()
 
-	// Mastodon WebSocket firehose
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runStream(ctx, stream)
-	}()
+	go func() { defer wg.Done(); runStream(ctx, stream) }()
 
-	// Redis producer: ingestion → stream
+	// Phase 2 — Redis queue
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := producer.Run(ctx, results); err != nil && ctx.Err() == nil {
+		if err := prod.Run(ctx, results); err != nil && ctx.Err() == nil {
 			log.Printf("[producer] exited: %v", err)
 		}
 	}()
 
-	// Redis consumer: stream → processed channel
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := consumer.Run(ctx, processed); err != nil && ctx.Err() == nil {
+		if err := cons.Run(ctx, processed); err != nil && ctx.Err() == nil {
 			log.Printf("[consumer] exited: %v", err)
 		}
 	}()
 
-	// Drain processed — Phase 3 will hand these to the AI batcher.
-	drainProcessed(ctx, processed)
+	// Phase 4 — fan-out orchestrator
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := batcher.Run(ctx, batched); err != nil && ctx.Err() == nil {
+			log.Printf("[batcher] exited: %v", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := writer.Run(ctx, batched); err != nil && ctx.Err() == nil {
+			log.Printf("[db-writer] exited: %v", err)
+		}
+	}()
 
 	wg.Wait()
 	log.Println("[engine] shutdown complete")
 }
 
-func newRedisClient() *redis.Client {
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
-		url = "redis://localhost:6379"
-	}
-	opt, err := redis.ParseURL(url)
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func mustRedis(ctx context.Context) *redis.Client {
+	opt, err := redis.ParseURL(getenv("REDIS_URL", "redis://localhost:6379"))
 	if err != nil {
 		log.Fatalf("[engine] invalid REDIS_URL: %v", err)
 	}
-	return redis.NewClient(opt)
+	client := redis.NewClient(opt)
+	if err := client.Ping(ctx).Err(); err != nil {
+		log.Fatalf("[engine] redis ping: %v", err)
+	}
+	return client
+}
+
+func mustPostgres(ctx context.Context) *pgxpool.Pool {
+	pool, err := pgxpool.New(ctx, getenv("POSTGRES_URL", "postgres://policy:policy@localhost:5432/policydb"))
+	if err != nil {
+		log.Fatalf("[engine] postgres connect: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		log.Fatalf("[engine] postgres ping: %v", err)
+	}
+	return pool
+}
+
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func feedJobs(ctx context.Context, jobs chan<- string) {
@@ -119,9 +154,7 @@ func feedJobs(ctx context.Context, jobs chan<- string) {
 			}
 		}
 	}
-
 	send()
-
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
@@ -142,32 +175,6 @@ func runStream(ctx context.Context, s *fetcher.StreamReader) {
 		select {
 		case <-time.After(reconnectWait):
 		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// drainProcessed logs throughput. Phase 3 replaces this with the AI batcher.
-func drainProcessed(ctx context.Context, processed <-chan models.Article) {
-	var total int64
-	ticker := time.NewTicker(logInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case _, ok := <-processed:
-			if !ok {
-				return
-			}
-			total++
-		case <-ticker.C:
-			log.Printf("[engine] articles processed: %d", total)
-		case <-ctx.Done():
-			for len(processed) > 0 {
-				<-processed
-				total++
-			}
-			log.Printf("[engine] shutdown. total processed: %d", total)
 			return
 		}
 	}
